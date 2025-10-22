@@ -53,3 +53,9 @@ echo "Signing the ${XCFRAMEWORK_NAME}" for distribution
 codesign --timestamp -v --sign "${IDENTITY}" "$BUILD_DIR/$XCFRAMEWORK_NAME"
 
 echo "✅ Done. Output: $BUILD_DIR/$XCFRAMEWORK_NAME"
+
+echo "Creating zip archive..."
+pushd "$BUILD_DIR" > /dev/null
+zip -r "${XCFRAMEWORK_NAME}.zip" "$XCFRAMEWORK_NAME"
+popd > /dev/null
+echo "✅ Zip archive created: $BUILD_DIR/${XCFRAMEWORK_NAME}.zip"
