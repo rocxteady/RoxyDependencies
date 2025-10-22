@@ -36,6 +36,36 @@ extension PassportReaderTrackingDelegate {
 }
 
 public class PassportReader : NSObject {
+    // Define the total number of steps in the process
+    private enum ReadingStep: Int, CaseIterable {
+        case noProgress = 0        // Initial state, no progress shown
+        case tagConnected = 1      // First step after tag is detected and connected
+        case authenticationStarted = 2
+        case authenticationCompleted = 3
+        case readingCOM = 4
+        case readingSOD = 5
+        case readingDG1 = 6
+        case readingDG2 = 7
+        case readingAdditionalDGs = 8
+        case verifyingAuthentication = 9
+        case completed = 10
+
+        var progress: CGFloat {
+            return CGFloat(self.rawValue) / CGFloat(ReadingStep.allCases.count - 1)
+        }
+    }
+    
+    private var currentStep: ReadingStep = .noProgress
+        
+    private var currentProgress: CGFloat {
+        return currentStep.progress
+    }
+    
+    private func updateProgress(to step: ReadingStep) {
+        currentStep = step
+        updateReaderSessionMessage()
+    }
+    
     private typealias NFCCheckedContinuation = CheckedContinuation<NFCPassportModel, Error>
     private var nfcContinuation: NFCCheckedContinuation?
 
@@ -103,7 +133,8 @@ public class PassportReader : NSObject {
         self.bacHandler = nil
         self.caHandler = nil
         self.paceHandler = nil
-        
+        self.currentStep = .noProgress
+
         // If no tags specified, read all
         if self.dataGroupsToRead.count == 0 {
             // Start off with .COM, will always read (and .SOD but we'll add that after), and then add the others from the COM
@@ -143,6 +174,9 @@ extension PassportReader : NFCTagReaderSessionDelegate {
         // If necessary, you may handle the error. Note session is no longer valid.
         // You must create a new session to restart RF polling.
         Logger.passportReader.debug( "tagReaderSession:didInvalidateWithError - \(error.localizedDescription)" )
+        
+        updateProgress(to: .noProgress)
+
         self.readerSession?.invalidate()
         self.readerSession = nil
 
@@ -200,6 +234,8 @@ extension PassportReader : NFCTagReaderSessionDelegate {
             do {
                 try await session.connect(to: tag)
                 
+                updateProgress(to: .tagConnected)
+
                 Logger.passportReader.debug( "tagReaderSession:connected to tag - starting authentication" )
                 self.updateReaderSessionMessage( alertMessage: NFCViewDisplayMessage.authenticatingWithPassport(0) )
                 
@@ -243,8 +279,41 @@ extension PassportReader : NFCTagReaderSessionDelegate {
         }
     }
     
-    func updateReaderSessionMessage(alertMessage: NFCViewDisplayMessage ) {
-        self.readerSession?.alertMessage = self.nfcViewDisplayMessageHandler?(alertMessage) ?? alertMessage.description
+    func updateReaderSessionMessage(alertMessage: NFCViewDisplayMessage? = nil) {
+        let alert = if let alertMessage = alertMessage {
+            self.nfcViewDisplayMessageHandler?(alertMessage) ?? alertMessage.description
+        } else {
+            self.readerSession?.alertMessage ?? ""
+        }
+        let message = alert.replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "🟢", with: "")
+            .replacingOccurrences(of: "⚪️", with: "")
+        
+        // Only show progress indicators after a tag has been detected
+        if currentProgress == 0 {
+            let message = if let alertMessage = alertMessage {
+               self.nfcViewDisplayMessageHandler?(alertMessage) ?? alertMessage.description
+           } else {
+               self.readerSession?.alertMessage ?? ""
+           }
+            self.readerSession?.alertMessage = message
+            return
+        }
+        
+        // Calculate progress from 0.1 to 1.0 (10 steps)
+        let progress = currentProgress
+        let completedCount = Int(progress * 10)
+        let incompleteCount = 10 - completedCount
+        
+        // Use filled and empty circles for progress indicator
+        let completedString = String(repeating: "🟢", count: completedCount)
+        let incompleteString = String(repeating: "⚪️", count: incompleteCount)
+        let progressString = completedString + incompleteString
+        
+        // Format: [Progress Bar]
+        //         Message
+        let formattedMessage = "\(progressString)\n\(message)"
+        self.readerSession?.alertMessage = formattedMessage
     }
 }
 
@@ -253,6 +322,8 @@ extension PassportReader {
     func startReading(tagReader : TagReader) async throws -> NFCPassportModel {
         trackingDelegate?.nfcTagDetected()
 
+        updateProgress(to: .authenticationStarted)
+        
         if !skipPACE {
             do {
                 trackingDelegate?.paceStarted()
@@ -272,6 +343,8 @@ extension PassportReader {
                 Logger.passportReader.debug( "PACE Succeeded" )
 
                 trackingDelegate?.paceSucceeded()
+                
+                updateProgress(to: .authenticationCompleted)
             } catch {
                 trackingDelegate?.paceFailed()
 
@@ -280,8 +353,10 @@ extension PassportReader {
             }
             
             _ = try await tagReader.selectPassportApplication()
+        } else {
+            updateProgress(to: .authenticationCompleted)
         }
-        
+
         // If either PACE isn't supported, we failed whilst doing PACE or we didn't even attempt it, then fall back to BAC
         if passport.PACEStatus != .success {
             do {
@@ -297,6 +372,8 @@ extension PassportReader {
         // Now to read the datagroups
         try await readDataGroups(tagReader: tagReader)
 
+        updateProgress(to: .verifyingAuthentication)
+        
         try await doActiveAuthenticationIfNeccessary(tagReader : tagReader)
 
         self.updateReaderSessionMessage(alertMessage: NFCViewDisplayMessage.successfulRead)
@@ -306,6 +383,8 @@ extension PassportReader {
         // If we have a masterlist url set then use that and verify the passport now
         self.passport.verifyPassport(masterListURL: self.masterListURL, useCMSVerification: self.passiveAuthenticationUsesOpenSSL)
 
+        updateProgress(to: .completed)
+        
         return self.passport
     }
     
@@ -346,10 +425,14 @@ extension PassportReader {
 
         self.updateReaderSessionMessage( alertMessage: NFCViewDisplayMessage.readingDataGroupProgress(.COM, 0) )
         
+        updateProgress(to: .readingCOM)
+        
         if let com = try await readDataGroup(tagReader:tagReader, dgId:.COM) as? COM {
             self.passport.addDataGroup( .COM, dataGroup:com )
             self.addDatagroupsToRead(com: com, to: &DGsToRead)
         }
+        
+        updateProgress(to: .readingSOD)
         
         if DGsToRead.contains( .DG14 ) {
             DGsToRead.removeAll { $0 == .DG14 }
@@ -385,8 +468,18 @@ extension PassportReader {
         if self.readAllDatagroups != true {
             DGsToRead = DGsToRead.filter { dataGroupsToRead.contains($0) }
         }
-        for dgId in DGsToRead {
+        for (index, dgId) in DGsToRead.enumerated() {
             self.updateReaderSessionMessage( alertMessage: NFCViewDisplayMessage.readingDataGroupProgress(dgId, 0) )
+            
+            // Update progress based on which datagroup we're reading
+            if dgId == .DG1 {
+                updateProgress(to: .readingDG1)
+            } else if dgId == .DG2 {
+                updateProgress(to: .readingDG2)
+            } else if index > 1 { // After DG1 and DG2, we're reading additional DGs
+                updateProgress(to: .readingAdditionalDGs)
+            }
+            
             if let dg = try await readDataGroup(tagReader:tagReader, dgId:dgId) {
                 self.passport.addDataGroup( dgId, dataGroup:dg )
             }
